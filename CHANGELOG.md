@@ -6,7 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.15.1-patch-v2]
+## [1.15.1-patch-v3]
+
+### Changed
+
+- Snapshot restore over userfaultfd registers guest memory for write
+  protection as well as missing pages, requests `UFFD_FEATURE_WP_ASYNC`
+  (Linux 6.7+) and falls back to synchronous write protection on older
+  kernels, so a handler can install every page write-protected and read the
+  pages the guest wrote from `/proc/<pid>/pagemap`. A kernel without
+  userfaultfd write protection keeps the missing-page registration only.
+  Hugepage-backed memory is write-protected up front. `MISSING_HUGETLBFS` is
+  requested alongside `EVENT_REMOVE`.
+
 
 ### Added
 

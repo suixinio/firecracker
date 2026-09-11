@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vm_memory::{Address, GuestMemoryRegion};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -505,6 +505,8 @@ pub enum GuestMemoryFromUffdError {
     Create(userfaultfd::Error),
     /// Failed to register memory address range with the userfaultfd object: {0}
     Register(userfaultfd::Error),
+    /// Failed to write-protect a memory address range with the userfaultfd object: {0}
+    WriteProtect(userfaultfd::Error),
     /// Failed to connect to UDS Unix stream: {0}
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
@@ -520,29 +522,64 @@ fn guest_memory_from_uffd(
     let (guest_memory, backend_mappings) =
         create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
 
-    let mut uffd_builder = UffdBuilder::new();
+    // EVENT_REMOVE: only used with balloon devices, but harmless without them because the
+    // only place the kernel checks it is a hook from madvise. MISSING_HUGETLBFS: hugepage-backed
+    // guest memory faults the same way. WP_ASYNC (Linux 6.7+): a write to a write-protected page
+    // clears the protection bit in place instead of raising an event, and the handler reads the
+    // written set from /proc/<pid>/pagemap. Older kernels fall back to synchronous write
+    // protection, where the handler resolves each first write itself.
+    let base_features = FeatureFlags::EVENT_REMOVE | FeatureFlags::MISSING_HUGETLBFS;
+    // The userfaultfd crate predates the flag; the value is the kernel's. An older kernel
+    // rejects it at UFFDIO_API, which the fallback below handles.
+    const UFFD_FEATURE_WP_ASYNC: u64 = 1 << 15;
+    let wp_async = FeatureFlags::from_bits_retain(UFFD_FEATURE_WP_ASYNC);
+    let uffd = match create_uffd(base_features | wp_async) {
+        Ok(uffd) => uffd,
+        Err(_) => create_uffd(base_features).map_err(GuestMemoryFromUffdError::Create)?,
+    };
 
-    // We only make use of this if balloon devices are present, but we can enable it unconditionally
-    // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
-    // actively change the behavior of UFFD, only passively. Without balloon devices
-    // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
-
-    let uffd = uffd_builder
-        .close_on_exec(true)
-        .non_blocking(true)
-        .user_mode_only(false)
-        .create()
-        .map_err(GuestMemoryFromUffdError::Create)?;
-
+    // Register for write protection as well as missing pages, so the handler can install every
+    // page write-protected and a pause captures exactly the pages the guest wrote. A kernel
+    // without userfaultfd write protection (before 5.7) gets the missing-page registration only.
+    let mut write_protected = true;
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        match uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+        ) {
+            Ok(_) => {}
+            Err(_) => {
+                write_protected = false;
+                uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
+                    .map_err(GuestMemoryFromUffdError::Register)?;
+            }
+        }
+    }
+
+    // Hugepage-backed memory can be write-protected up front. Anonymous memory cannot: the
+    // protection bit for a page is set when the handler installs it (UFFDIO_COPY_MODE_WP), since
+    // a bit set on an absent page is wiped by the first missing-page fault.
+    if write_protected && huge_pages.is_hugetlbfs() {
+        for mem_region in guest_memory.iter() {
+            uffd.write_protect(mem_region.as_ptr().cast(), mem_region.size() as _)
+                .map_err(GuestMemoryFromUffdError::WriteProtect)?;
+        }
     }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
 
     Ok((guest_memory, Some(uffd)))
+}
+
+fn create_uffd(features: FeatureFlags) -> Result<Uffd, userfaultfd::Error> {
+    let mut uffd_builder = UffdBuilder::new();
+    uffd_builder.require_features(features);
+    uffd_builder
+        .close_on_exec(true)
+        .non_blocking(true)
+        .user_mode_only(false)
+        .create()
 }
 
 /// Builds a list of [`GuestRegionUffdMapping`]s from an iterator of memory regions.
